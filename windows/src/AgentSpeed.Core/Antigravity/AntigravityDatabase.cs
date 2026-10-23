@@ -36,7 +36,7 @@ internal static class AntigravityDatabase
                     lastActivity = completed ?? finished ?? created ?? lastActivity;
                     var type = steps.GetInt64(1);
                     var status = steps.GetInt64(2);
-                    var active = status is 1 or 2 or 8 or 11;
+                    var active = status is 1 or 2 or 8 or 9 or 11;
                     phase = active ? (type is 14 or 15 ? AgentPhase.Generating : AgentPhase.Tools) : AgentPhase.Idle;
                     inFlight = phase == AgentPhase.Generating ? created : null;
                 }

@@ -146,6 +146,99 @@ public sealed class AntigravityTests
         Assert.Equal(1_790_000_000_000, read.Agent.InFlightStartMs);
     }
 
+    [Theory]
+    [InlineData(SourceKind.Antigravity)]
+    [InlineData(SourceKind.AntigravityCli)]
+    public void RunningSummaryShowsLiveSpeedBeforePlannerIsPersistedAndIdleStopsIt(SourceKind kind)
+    {
+        using var temp = new TempDirectory();
+        var root = temp.Combine("conversations");
+        Directory.CreateDirectory(root);
+        using var db = Database(Path.Combine(root, "session.db"));
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        Generation(db, 1, now - 20_000);
+        using var summaries = SummaryDatabase(temp.Combine("conversation_summaries.db"));
+        Summary(summaries, "CASCADE_RUN_STATUS_IDLE", now - 20_000);
+        var config = new MonitorConfiguration(new HashSet<SourceKind> { kind });
+        var locations = new SourceLocations("", "", "", "", [],
+            kind == SourceKind.Antigravity ? root : "", kind == SourceKind.AntigravityCli ? root : "");
+        using var core = new MonitorCore(config, locations, now - 60_000);
+        core.Seed(now, now - 60_000, CancellationToken.None);
+        Assert.Equal(0, Snapshot(core, now).Live.Output);
+
+        // Only summary state changes: the conversation DB still contains the previous completed answer.
+        Summary(summaries, "CASCADE_RUN_STATUS_RUNNING", now - 5000);
+        Assert.True(core.PollRecent(now));
+        var generating = Snapshot(core, now);
+        Assert.Equal(1, generating.GeneratingCount);
+        Assert.Equal(100, generating.Live.Output);
+        Assert.Equal(1, generating.LiveEstimatedShare);
+        Assert.Equal(1, generating.Today.Requests);
+
+        Summary(summaries, "CASCADE_RUN_STATUS_IDLE", now);
+        Assert.True(core.PollRecent(now));
+        Assert.Equal(0, Snapshot(core, now).Live.Output);
+        Assert.Equal(0, Snapshot(core, now).GeneratingCount);
+    }
+
+    [Fact]
+    public void LosingSummaryStopsCachedGenerationInsteadOfLeavingTheGaugeRunning()
+    {
+        using var temp = new TempDirectory();
+        var root = temp.Combine("conversations");
+        Directory.CreateDirectory(root);
+        using var db = Database(Path.Combine(root, "session.db"));
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        Generation(db, 1, now - 20_000);
+        var summaryPath = temp.Combine("conversation_summaries.db");
+        using (var summaries = SummaryDatabase(summaryPath)) Summary(summaries, "CASCADE_RUN_STATUS_RUNNING", now - 5000);
+        var config = new MonitorConfiguration(new HashSet<SourceKind> { SourceKind.Antigravity });
+        using var core = new MonitorCore(config, new SourceLocations("", "", "", "", [], root), now - 60_000);
+        core.Seed(now, now - 60_000, CancellationToken.None);
+        Assert.True(Snapshot(core, now).Live.Output > 0);
+        File.Delete(summaryPath);
+        Assert.True(core.PollRecent(now));
+        Assert.Equal(0, Snapshot(core, now).Live.Output);
+    }
+
+    [Theory]
+    [InlineData(2)]
+    [InlineData(9)]
+    public void RunningSummaryDoesNotTurnAnExecutingOrWaitingToolIntoGeneration(int status)
+    {
+        using var temp = new TempDirectory();
+        var root = temp.Combine("conversations");
+        Directory.CreateDirectory(root);
+        using var db = Database(Path.Combine(root, "session.db"));
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        Generation(db, 1, now - 20_000);
+        using var step = db.Prepare("INSERT INTO steps VALUES (2, 132, ?1, ?2)");
+        step.Bind(1, (long)status).BindBlob(2, Bytes(1, Timestamp(now - 5000))).Run();
+        using var summaries = SummaryDatabase(temp.Combine("conversation_summaries.db"));
+        Summary(summaries, "CASCADE_RUN_STATUS_RUNNING", now - 5000);
+        var config = new MonitorConfiguration(new HashSet<SourceKind> { SourceKind.Antigravity });
+        using var core = new MonitorCore(config, new SourceLocations("", "", "", "", [], root), now - 60_000);
+        core.Seed(now, now - 60_000, CancellationToken.None);
+        var snapshot = Snapshot(core, now);
+        Assert.Equal(0, snapshot.GeneratingCount);
+        Assert.Equal(1, snapshot.ToolsCount);
+        Assert.Equal(0, snapshot.Live.Output);
+    }
+
+    private static SqliteConnection SummaryDatabase(string path)
+    {
+        var db = SqliteConnection.Open(path, SqliteOpenMode.ReadWriteCreate);
+        db.Execute("CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, status TEXT, last_modified_time TEXT, last_user_input_time TEXT, killed INTEGER)");
+        db.Execute("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0");
+        return db;
+    }
+
+    private static void Summary(SqliteConnection db, string status, long ms)
+    {
+        using var statement = db.Prepare("INSERT OR REPLACE INTO conversation_summaries VALUES ('session', ?1, ?2, ?2, 0)");
+        statement.Bind(1, status).Bind(2, DateTimeOffset.FromUnixTimeMilliseconds(ms).ToString("o")).Run();
+    }
+
     private static SpeedSnapshot Snapshot(MonitorCore core, long now) =>
         core.BuildSnapshot(now, now - 60_000, MonitorState.Running, observeLive: false).Snapshot;
 
